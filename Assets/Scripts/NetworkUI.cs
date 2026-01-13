@@ -19,7 +19,7 @@ public class NetworkUI : MonoBehaviour
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
     {
-        
+        NetworkManager.Singleton.OnConnectionEvent += OnConnectionEvent;
     }
 
     // Update is called once per frame
@@ -42,5 +42,25 @@ public class NetworkUI : MonoBehaviour
     private void OnStartClientButtonClicked()
     {
         NetworkManager.Singleton.StartClient();
+    }
+
+    private void ShowConnectionUI(bool show)
+    {
+        startHostButton.gameObject.SetActive(show);
+        startClientButton.gameObject.SetActive(show);
+    }
+
+    private void OnConnectionEvent(NetworkManager networkManager, ConnectionEventData connectionEventData)
+    {
+        ShowConnectionUI(false);
+    }
+
+    private void OnDestroy()
+    {
+        if (NetworkManager.Singleton != null)
+        {
+            NetworkManager.Singleton.OnConnectionEvent -= OnConnectionEvent;
+        }
+        
     }
 }
