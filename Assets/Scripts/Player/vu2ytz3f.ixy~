@@ -1,5 +1,6 @@
 using Unity.Netcode;
 using UnityEngine;
+using UnityEngine.InputSystem;
 
 public class PlayerController : NetworkBehaviour
 {
@@ -8,11 +9,13 @@ public class PlayerController : NetworkBehaviour
     [Header("Movement Settings")]
     [SerializeField] private float moveSpeed = 5f;
     [SerializeField] private float jumpForce = 7f;
-    [SerializeField] private float rotationSmoothTime = 0.05f;
-    private float currentVelocity;
+    [SerializeField] private float rotationSmoothTime = 0.1f;
+
+    // tracks rotation speed independently of physics velocity
+    private float rotationVelocity;
 
     [Header("Camera Settings")]
-    [SerializeField] private Vector3 cameraOffset = new Vector3(0f, 1.5f, -3.5f);
+    [SerializeField] private Vector3 cameraOffset = new Vector3(0f, 2f, -4f);
     [SerializeField] private float mouseSensitivity = 0.15f;
     [SerializeField] private float verticalMin = -30f;
     [SerializeField] private float verticalMax = 60f;
@@ -22,21 +25,19 @@ public class PlayerController : NetworkBehaviour
 
     [Header("References")]
     [SerializeField] private Material[] playerMaterials;
+    [SerializeField] private LayerMask groundLayer;
     private Rigidbody rb;
     private Camera playerCamera;
 
-    // Server-side state
     private Vector2 serverInputVector;
     private float serverCameraYRotation;
     private bool isGrounded;
 
     private void Awake()
     {
-        // Now referencing the Rigidbody on the SAME object
         rb = GetComponent<Rigidbody>();
-
-        // Ensure the character doesn't tip over
         rb.freezeRotation = true;
+        // Interpolate helps smooth out network movement
         rb.interpolation = RigidbodyInterpolation.Interpolate;
     }
 
@@ -46,15 +47,21 @@ public class PlayerController : NetworkBehaviour
         {
             inputActions = new InputSystem_Actions();
             inputActions.Enable();
-
-            inputActions.Player.Jump.performed += _ => JumpServerRpc();
+            inputActions.Player.Jump.performed += OnJumpInput;
 
             playerCamera = Camera.main;
-            playerCamera.transform.SetParent(null);
             Cursor.lockState = CursorLockMode.Locked;
         }
-
         SetupPlayerVisuals();
+    }
+
+    public override void OnNetworkDespawn()
+    {
+        if (IsOwner && inputActions != null)
+        {
+            inputActions.Player.Jump.performed -= OnJumpInput;
+            inputActions.Disable();
+        }
     }
 
     private void Update()
@@ -65,7 +72,10 @@ public class PlayerController : NetworkBehaviour
             Vector2 input = inputActions.Player.Move.ReadValue<Vector2>();
             MoveServerRpc(input, playerCamera.transform.eulerAngles.y);
         }
+    }
 
+    private void FixedUpdate()
+    {
         if (IsServer)
         {
             CheckGrounded();
@@ -76,7 +86,6 @@ public class PlayerController : NetworkBehaviour
     private void HandleCameraRotation()
     {
         if (playerCamera == null) return;
-
         Vector2 mouseDelta = inputActions.Player.Look.ReadValue<Vector2>() * mouseSensitivity;
 
         camRotationY += mouseDelta.x;
@@ -84,11 +93,11 @@ public class PlayerController : NetworkBehaviour
         camRotationX = Mathf.Clamp(camRotationX, verticalMin, verticalMax);
 
         Quaternion rotation = Quaternion.Euler(camRotationX, camRotationY, 0);
-
-        // The camera follows the parent position
         playerCamera.transform.position = transform.position + (rotation * cameraOffset);
         playerCamera.transform.LookAt(transform.position + Vector3.up * 1.5f);
     }
+
+    private void OnJumpInput(InputAction.CallbackContext context) => JumpServerRpc();
 
     [ServerRpc]
     private void MoveServerRpc(Vector2 input, float cameraYRotation)
@@ -102,50 +111,65 @@ public class PlayerController : NetworkBehaviour
     {
         if (isGrounded)
         {
-            // Adding force directly to the parent Rigidbody
-            rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
+            // VelocityChange ignores mass, making jumps consistent
+            rb.AddForce(Vector3.up * jumpForce, ForceMode.VelocityChange);
+            isGrounded = false;
         }
     }
 
     private void MovePlayer()
     {
-        // Calculate movement direction relative to camera's horizontal (Y) rotation ONLY
         Vector3 forward = Quaternion.Euler(0, serverCameraYRotation, 0) * Vector3.forward;
         Vector3 right = Quaternion.Euler(0, serverCameraYRotation, 0) * Vector3.right;
 
-        // We ensure y is 0 so we don't accidentally move into the floor or sky
-        forward.y = 0;
-        right.y = 0;
+        Vector3 moveDir = (forward * serverInputVector.y + right * serverInputVector.x).normalized;
+        Vector3 targetVelocity = moveDir * moveSpeed;
 
-        Vector3 moveDir = (forward.normalized * serverInputVector.y + right.normalized * serverInputVector.x).normalized;
+        // FIXED: Only calculate change for X and Z. 
+        // If we include Y here, it will fight against the Jump force.
+        Vector3 currentV = rb.linearVelocity;
+        Vector3 velocityChange = new Vector3(
+            targetVelocity.x - currentV.x,
+            0f,
+            targetVelocity.z - currentV.z
+        );
+
+        rb.AddForce(velocityChange, ForceMode.VelocityChange);
 
         if (moveDir.sqrMagnitude > 0.01f)
         {
-            // Move position authoritatively
-            Vector3 nextPosition = rb.position + moveDir * moveSpeed * Time.deltaTime;
-            rb.MovePosition(nextPosition);
-
-            // Rotate the player to face movement direction
             float targetAngle = Mathf.Atan2(moveDir.x, moveDir.z) * Mathf.Rad2Deg;
-            float angle = Mathf.SmoothDampAngle(rb.rotation.eulerAngles.y, targetAngle, ref currentVelocity, rotationSmoothTime);
+            // Use the rotationVelocity float we added at the top
+            float angle = Mathf.SmoothDampAngle(transform.eulerAngles.y, targetAngle, ref rotationVelocity, rotationSmoothTime);
             rb.MoveRotation(Quaternion.Euler(0, angle, 0));
         }
     }
-    
+
     private void CheckGrounded()
     {
-        // Raycast from the center of the capsule downwards
-        // 1.1f assumes a standard 2m tall capsule
-        isGrounded = Physics.Raycast(transform.position, Vector3.down, 1.1f);
+        // Start slightly higher than the floor to ensure we detect the Court layer
+        Vector3 spherePos = transform.position + Vector3.up * 0.2f;
+        float radius = 0.3f;
+
+        // Use the mask from the inspector (Default and Court) 
+        // but exclude the Player layer so you don't jump off yourself.
+        int playerLayer = LayerMask.NameToLayer("Player");
+        int finalMask = groundLayer & ~(1 << playerLayer);
+
+        isGrounded = Physics.CheckSphere(spherePos, radius, finalMask, QueryTriggerInteraction.Ignore);
+
+        // Debug: Green = Grounded, Red = Air
+        Debug.DrawRay(spherePos, Vector3.down * radius, isGrounded ? Color.green : Color.red);
     }
 
     private void SetupPlayerVisuals()
     {
-        Transform arrowTransform = transform.Find("Arrow");
-        if (arrowTransform != null && playerMaterials.Length > 0)
+        Transform arrow = transform.Find("Arrow");
+        if (arrow != null && playerMaterials.Length > 0)
         {
-            uint matIndex = (uint)OwnerClientId % (uint)playerMaterials.Length;
-            arrowTransform.GetComponent<MeshRenderer>().material = playerMaterials[matIndex];
+            MeshRenderer arrowRenderer = arrow.GetComponent<MeshRenderer>();
+            int matIndex = (int)(OwnerClientId % (ulong)playerMaterials.Length);
+            arrowRenderer.material = playerMaterials[matIndex];
         }
     }
 }
