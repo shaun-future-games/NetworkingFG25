@@ -200,21 +200,22 @@ public class PlayerController : NetworkBehaviour
 
         if (heldBall.TryGetComponent(out heldBallCollider))
         {
-            // Get the player's own collider (likely a CapsuleCollider)
             Collider playerCollider = GetComponent<Collider>();
-
-            // SURGICAL FIX: Ignore collision ONLY between this player and THIS ball
             Physics.IgnoreCollision(playerCollider, heldBallCollider, true);
         }
 
         var ballRb = heldBall.GetComponent<Rigidbody>();
         ballRb.isKinematic = true;
+        ballRb.useGravity = false; // Disable gravity while held
 
-        // Parent to player root
+        // Parent to the PlayerPrefab
+        // Use the NetworkObject's TrySetParent to ensure it replicates to all clients
         bool success = ballNetObj.TrySetParent(this.NetworkObject, false);
 
         if (success)
         {
+            // Snap the ball exactly to the holdPosition's LOCAL coordinates
+            // since the ball is now a sibling/child within the same hierarchy
             heldBall.transform.localPosition = holdPosition.localPosition;
             heldBall.transform.localRotation = holdPosition.localRotation;
 
@@ -245,25 +246,30 @@ public class PlayerController : NetworkBehaviour
             float powerPercent = currentChargeTime / maxChargeTime;
             float totalForce = Mathf.Lerp(minThrowForce, maxThrowForce, powerPercent);
 
+            // 1. Unparent first
             ballNetObj.TrySetParent((Transform)null, true);
 
+            // 2. Re-enable Physics
             var ballRb = heldBall.GetComponent<Rigidbody>();
             ballRb.isKinematic = false;
+            ballRb.useGravity = true;
 
-            // Re-enable collision between this player and this ball
             if (heldBallCollider != null)
             {
                 Physics.IgnoreCollision(GetComponent<Collider>(), heldBallCollider, false);
             }
 
-            Vector3 throwDir = Quaternion.Euler(camRotationX, serverCameraYRotation, 0) * Vector3.forward;
+            // 3. Calculate direction based on Camera look direction
+            // We use the playerCamera's forward if available, otherwise transform.forward
+            Vector3 throwDir = playerCamera != null ? playerCamera.transform.forward : transform.forward;
+
             ballRb.AddForce(throwDir * totalForce, ForceMode.Impulse);
 
             if (heldBall.TryGetComponent(out BallProperties props))
                 props.SetThrown(powerPercent);
 
             heldBall = null;
-            heldBallCollider = null; // Clear reference
+            heldBallCollider = null;
             currentChargeTime = 0;
         }
     }
