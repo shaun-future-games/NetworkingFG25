@@ -1,5 +1,6 @@
 using Unity.Netcode;
 using UnityEngine;
+using System.Collections;
 
 public class PlayerController : NetworkBehaviour
 {
@@ -10,6 +11,18 @@ public class PlayerController : NetworkBehaviour
     [SerializeField] private float jumpForce = 7f;
     [SerializeField] private float rotationSmoothTime = 0.05f;
     private float currentVelocity;
+
+    [Header("Combat & Health")]
+    public NetworkVariable<int> Health = new NetworkVariable<int>(100);
+    [SerializeField] private Transform holdPosition;
+    [SerializeField] private float maxChargeTime = 3f;
+    [SerializeField] private float maxThrowForce = 25f;
+    [SerializeField] private float minThrowForce = 5f;
+
+    private float currentChargeTime = 0f;
+    private bool isCharging = false;
+    private GameObject heldBall; // Only tracked on Server
+    private Collider heldBallCollider;
 
     [Header("Camera Settings")]
     [SerializeField] private Vector3 cameraOffset = new Vector3(0f, 1.5f, -3.5f);
@@ -25,17 +38,13 @@ public class PlayerController : NetworkBehaviour
     private Rigidbody rb;
     private Camera playerCamera;
 
-    // Server-side state
     private Vector2 serverInputVector;
     private float serverCameraYRotation;
     private bool isGrounded;
 
     private void Awake()
     {
-        // Now referencing the Rigidbody on the SAME object
         rb = GetComponent<Rigidbody>();
-
-        // Ensure the character doesn't tip over
         rb.freezeRotation = true;
         rb.interpolation = RigidbodyInterpolation.Interpolate;
     }
@@ -48,6 +57,9 @@ public class PlayerController : NetworkBehaviour
             inputActions.Enable();
 
             inputActions.Player.Jump.performed += _ => JumpServerRpc();
+            inputActions.Player.Interact.performed += _ => TryPickupBallServerRpc();
+            inputActions.Player.Attack.started += _ => StartChargeServerRpc();
+            inputActions.Player.Attack.canceled += _ => ReleaseThrowServerRpc();
 
             playerCamera = Camera.main;
             playerCamera.transform.SetParent(null);
@@ -55,6 +67,7 @@ public class PlayerController : NetworkBehaviour
         }
 
         SetupPlayerVisuals();
+        SpawnCharacterAtSpawnPoint();
     }
 
     private void Update()
@@ -70,6 +83,7 @@ public class PlayerController : NetworkBehaviour
         {
             CheckGrounded();
             MovePlayer();
+            HandleCharging();
         }
     }
 
@@ -85,7 +99,6 @@ public class PlayerController : NetworkBehaviour
 
         Quaternion rotation = Quaternion.Euler(camRotationX, camRotationY, 0);
 
-        // The camera follows the parent position
         playerCamera.transform.position = transform.position + (rotation * cameraOffset);
         playerCamera.transform.LookAt(transform.position + Vector3.up * 1.5f);
     }
@@ -102,18 +115,15 @@ public class PlayerController : NetworkBehaviour
     {
         if (isGrounded)
         {
-            // Adding force directly to the parent Rigidbody
             rb.AddForce(Vector3.up * jumpForce, ForceMode.Impulse);
         }
     }
 
     private void MovePlayer()
     {
-        // Calculate movement direction relative to camera's horizontal (Y) rotation ONLY
         Vector3 forward = Quaternion.Euler(0, serverCameraYRotation, 0) * Vector3.forward;
         Vector3 right = Quaternion.Euler(0, serverCameraYRotation, 0) * Vector3.right;
 
-        // We ensure y is 0 so we don't accidentally move into the floor or sky
         forward.y = 0;
         right.y = 0;
 
@@ -121,21 +131,17 @@ public class PlayerController : NetworkBehaviour
 
         if (moveDir.sqrMagnitude > 0.01f)
         {
-            // Move position authoritatively
             Vector3 nextPosition = rb.position + moveDir * moveSpeed * Time.deltaTime;
             rb.MovePosition(nextPosition);
 
-            // Rotate the player to face movement direction
             float targetAngle = Mathf.Atan2(moveDir.x, moveDir.z) * Mathf.Rad2Deg;
             float angle = Mathf.SmoothDampAngle(rb.rotation.eulerAngles.y, targetAngle, ref currentVelocity, rotationSmoothTime);
             rb.MoveRotation(Quaternion.Euler(0, angle, 0));
         }
     }
-    
+
     private void CheckGrounded()
     {
-        // Raycast from the center of the capsule downwards
-        // 1.1f assumes a standard 2m tall capsule
         isGrounded = Physics.Raycast(transform.position, Vector3.down, 1.1f);
     }
 
@@ -147,5 +153,125 @@ public class PlayerController : NetworkBehaviour
             uint matIndex = (uint)OwnerClientId % (uint)playerMaterials.Length;
             arrowTransform.GetComponent<MeshRenderer>().material = playerMaterials[matIndex];
         }
+    }
+
+    private void SpawnCharacterAtSpawnPoint()
+    {
+        var spawner = NetworkManager.Singleton.GetComponent<RandomPositionPlayerSpawner>();
+        if (spawner != null)
+        {
+            var nextSpawnPosition = spawner.GetNextSpawnPosition();
+            transform.position = nextSpawnPosition;
+            if (nextSpawnPosition.x < 0)
+            {
+                transform.rotation = Quaternion.Euler(0, 90, 0);
+                camRotationY = 90;
+            }
+            else
+            {
+                transform.rotation = Quaternion.Euler(0, -90, 0);
+                camRotationY = -90;
+            }
+        }
+    }
+
+    [ServerRpc]
+    private void TryPickupBallServerRpc()
+    {
+        if (heldBall != null) return;
+
+        Collider[] colliders = Physics.OverlapSphere(transform.position, 2f);
+        foreach (var col in colliders)
+        {
+            if (col.CompareTag("Ball"))
+            {
+                if (col.TryGetComponent(out NetworkObject ballNetObj))
+                {
+                    PickupBall(ballNetObj); // Now correctly passing NetworkObject
+                    break;
+                }
+            }
+        }
+    }
+
+    private void PickupBall(NetworkObject ballNetObj)
+    {
+        heldBall = ballNetObj.gameObject;
+
+        if (heldBall.TryGetComponent(out heldBallCollider))
+        {
+            // Get the player's own collider (likely a CapsuleCollider)
+            Collider playerCollider = GetComponent<Collider>();
+
+            // SURGICAL FIX: Ignore collision ONLY between this player and THIS ball
+            Physics.IgnoreCollision(playerCollider, heldBallCollider, true);
+        }
+
+        var ballRb = heldBall.GetComponent<Rigidbody>();
+        ballRb.isKinematic = true;
+
+        // Parent to player root
+        bool success = ballNetObj.TrySetParent(this.NetworkObject, false);
+
+        if (success)
+        {
+            heldBall.transform.localPosition = holdPosition.localPosition;
+            heldBall.transform.localRotation = holdPosition.localRotation;
+
+            if (heldBall.TryGetComponent(out BallProperties props))
+                props.SetHeldState(true, OwnerClientId);
+        }
+    }
+
+    [ServerRpc]
+    private void StartChargeServerRpc() { if (heldBall != null) isCharging = true; }
+
+    private void HandleCharging()
+    {
+        if (isCharging && heldBall != null)
+        {
+            currentChargeTime = Mathf.Min(currentChargeTime + Time.deltaTime, maxChargeTime);
+        }
+    }
+
+    [ServerRpc]
+    private void ReleaseThrowServerRpc()
+    {
+        if (heldBall == null) return;
+
+        if (heldBall.TryGetComponent(out NetworkObject ballNetObj))
+        {
+            isCharging = false;
+            float powerPercent = currentChargeTime / maxChargeTime;
+            float totalForce = Mathf.Lerp(minThrowForce, maxThrowForce, powerPercent);
+
+            ballNetObj.TrySetParent((Transform)null, true);
+
+            var ballRb = heldBall.GetComponent<Rigidbody>();
+            ballRb.isKinematic = false;
+
+            // Re-enable collision between this player and this ball
+            if (heldBallCollider != null)
+            {
+                Physics.IgnoreCollision(GetComponent<Collider>(), heldBallCollider, false);
+            }
+
+            Vector3 throwDir = Quaternion.Euler(camRotationX, serverCameraYRotation, 0) * Vector3.forward;
+            ballRb.AddForce(throwDir * totalForce, ForceMode.Impulse);
+
+            if (heldBall.TryGetComponent(out BallProperties props))
+                props.SetThrown(powerPercent);
+
+            heldBall = null;
+            heldBallCollider = null; // Clear reference
+            currentChargeTime = 0;
+        }
+    }
+
+    public void TakeDamage(int damage, Vector3 knockbackForce)
+    {
+        if (!IsServer) return;
+        Health.Value -= damage;
+        rb.AddForce(knockbackForce, ForceMode.Impulse);
     }
 }

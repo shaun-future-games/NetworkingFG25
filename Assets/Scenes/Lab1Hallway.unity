@@ -866,7 +866,7 @@ MonoBehaviour:
   m_DisconnectTimeoutMS: 30000
   ConnectionData:
     Address: 127.0.0.1
-    Port: 5555
+    Port: 7777
     ServerListenAddress: 127.0.0.1
     ClientBindPort: 0
   DebugSimulator:
@@ -929,10 +929,10 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   m_SpawnMethod: 1
   m_SpawnPositions:
-  - {x: 6, y: 0, z: -2}
-  - {x: 6, y: 0, z: 2}
-  - {x: -6, y: 0, z: -2}
-  - {x: -6, y: 0, z: 2}
+  - {x: 6, y: 1, z: -2}
+  - {x: 6, y: 1, z: 2}
+  - {x: -6, y: 1, z: -2}
+  - {x: -6, y: 1, z: 2}
 --- !u!1 &1518859752
 GameObject:
   m_ObjectHideFlags: 0
